@@ -1,6 +1,12 @@
 {
   "functions": {
     "src/app/api/download/route.ts": {
+      "maxDuration": 300
+    },
+    "src/app/api/download/[id]/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/report/route.ts": {
       "maxDuration": 30
     }
   },
@@ -21,6 +27,15 @@
         {
           "key": "Strict-Transport-Security",
           "value": "max-age=63072000; includeSubDomains; preload"
+        }
+      ]
+    },
+    {
+      "source": "/api/download",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-cache, no-store, must-revalidate"
         }
       ]
     }

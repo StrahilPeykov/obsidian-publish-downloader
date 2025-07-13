@@ -18,7 +18,7 @@ export const rateLimiter = new Ratelimit({
 export function validateObsidianUrl(url: string): boolean {
   try {
     const parsed = new URL(url)
-    return parsed.hostname === 'publish.obsidian.md'
+    return parsed.hostname === 'publish.obsidian.md' && parsed.pathname !== '/'
   } catch {
     return false
   }
@@ -26,8 +26,13 @@ export function validateObsidianUrl(url: string): boolean {
 
 // Extract vault ID from URL
 export function extractVaultId(url: string): string {
-  const parsed = new URL(url)
-  return parsed.pathname.split('/')[1] || ''
+  try {
+    const parsed = new URL(url)
+    const pathParts = parsed.pathname.split('/').filter(Boolean)
+    return pathParts[0] || ''
+  } catch {
+    return ''
+  }
 }
 
 // Generate download ID
@@ -40,7 +45,8 @@ export async function isVaultBlocked(vaultId: string): Promise<boolean> {
   try {
     const blocked = await redis.sismember('blocked_vaults', vaultId)
     return !!blocked
-  } catch {
+  } catch (error) {
+    console.error('Error checking vault blocked status:', error)
     return false
   }
 }
@@ -52,32 +58,67 @@ export async function logConsent(data: {
   vaultId: string
   timestamp: string
 }) {
-  const key = `consent:${data.vaultId}:${Date.now()}`
-  await redis.setex(key, 30 * 24 * 60 * 60, JSON.stringify(data)) // Keep for 30 days
+  try {
+    const key = `consent:${data.vaultId}:${Date.now()}`
+    await redis.setex(key, 30 * 24 * 60 * 60, JSON.stringify(data)) // Keep for 30 days
+    
+    // Also log to a general consent list for auditing
+    await redis.lpush('consent_log', JSON.stringify({
+      ...data,
+      loggedAt: new Date().toISOString()
+    }))
+    
+    // Keep only last 10000 consent logs
+    await redis.ltrim('consent_log', 0, 9999)
+  } catch (error) {
+    console.error('Error logging consent:', error)
+    // Don't throw - this shouldn't block the download
+  }
 }
 
-// Check robots.txt
+// Enhanced robots.txt checking with proper timeout handling
 export async function checkRobotsTxt(baseUrl: string): Promise<boolean> {
   try {
     const robotsUrl = new URL('/robots.txt', baseUrl)
-    const response = await fetch(robotsUrl.toString())
+    
+    // Use AbortController for timeout
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 5000)
+    
+    const response = await fetch(robotsUrl.toString(), {
+      headers: {
+        'User-Agent': 'ObsidianDownloader/1.0 (+https://obsidian.strahil.dev)'
+      },
+      signal: controller.signal
+    })
+    
+    clearTimeout(timeoutId)
     
     if (!response.ok) return true // If no robots.txt, assume allowed
     
     const text = await response.text()
-    const lines = text.split('\n')
+    const lines = text.split('\n').map(line => line.trim().toLowerCase())
+    
+    let userAgentMatch = false
     
     for (const line of lines) {
-      if (line.toLowerCase().includes('user-agent: *')) {
-        const nextLine = lines[lines.indexOf(line) + 1]
-        if (nextLine?.toLowerCase().includes('disallow: /')) {
+      if (line.startsWith('user-agent:')) {
+        const agent = line.split(':')[1]?.trim()
+        userAgentMatch = agent === '*' || agent === 'obsidiandownloader'
+        continue
+      }
+      
+      if (userAgentMatch && line.startsWith('disallow:')) {
+        const path = line.split(':')[1]?.trim()
+        if (path === '/' || path === '') {
           return false
         }
       }
     }
     
     return true
-  } catch {
+  } catch (error) {
+    console.error('Error checking robots.txt:', error)
     return true // On error, assume allowed
   }
 }
@@ -87,5 +128,88 @@ export function sanitizeFilename(filename: string): string {
   return filename
     .replace(/[<>:"/\\|?*]/g, '_')
     .replace(/\s+/g, '_')
+    .replace(/\.+/g, '.')
     .substring(0, 200) // Limit length
+}
+
+// Block a vault (for takedown requests)
+export async function blockVault(vaultId: string, reason?: string): Promise<void> {
+  try {
+    await redis.sadd('blocked_vaults', vaultId)
+    
+    // Log the blocking action
+    const blockData = {
+      vaultId,
+      reason: reason || 'Owner request',
+      blockedAt: new Date().toISOString()
+    }
+    
+    await redis.hset(`blocked_vault:${vaultId}`, blockData)
+    console.log(`Vault ${vaultId} has been blocked:`, blockData)
+  } catch (error) {
+    console.error('Error blocking vault:', error)
+    throw error
+  }
+}
+
+// Get blocked vault info
+export async function getBlockedVaultInfo(vaultId: string) {
+  try {
+    return await redis.hgetall(`blocked_vault:${vaultId}`)
+  } catch (error) {
+    console.error('Error getting blocked vault info:', error)
+    return null
+  }
+}
+
+// Unblock a vault (for resolved disputes)
+export async function unblockVault(vaultId: string): Promise<void> {
+  try {
+    await redis.srem('blocked_vaults', vaultId)
+    await redis.del(`blocked_vault:${vaultId}`)
+    console.log(`Vault ${vaultId} has been unblocked`)
+  } catch (error) {
+    console.error('Error unblocking vault:', error)
+    throw error
+  }
+}
+
+// Get download statistics with proper typing
+export async function getDownloadStats() {
+  try {
+    const totalDownloadsRaw = await redis.get('total_downloads')
+    const dailyDownloadsRaw = await redis.get(`daily_downloads:${new Date().toISOString().split('T')[0]}`)
+    
+    // Handle Redis returning null/undefined by providing defaults
+    const totalDownloads = typeof totalDownloadsRaw === 'string' ? totalDownloadsRaw : '0'
+    const dailyDownloads = typeof dailyDownloadsRaw === 'string' ? dailyDownloadsRaw : '0'
+    
+    return {
+      total: parseInt(totalDownloads, 10) || 0,
+      today: parseInt(dailyDownloads, 10) || 0
+    }
+  } catch (error) {
+    console.error('Error getting download stats:', error)
+    return { total: 0, today: 0 }
+  }
+}
+
+// Increment download counter
+export async function incrementDownloadCount(vaultId: string): Promise<void> {
+  try {
+    const today = new Date().toISOString().split('T')[0]
+    
+    // Increment total downloads
+    await redis.incr('total_downloads')
+    
+    // Increment daily downloads
+    await redis.incr(`daily_downloads:${today}`)
+    await redis.expire(`daily_downloads:${today}`, 24 * 60 * 60) // Expire after 24 hours
+    
+    // Track vault-specific downloads
+    await redis.incr(`vault_downloads:${vaultId}`)
+  } catch (error) {
+    console.error('Error incrementing download count:', error)
+    // Don't throw - this shouldn't block the download
+  }
 }
