@@ -1,18 +1,33 @@
 import { Redis } from '@upstash/redis'
 import { Ratelimit } from '@upstash/ratelimit'
 
-// Initialize Redis client
-export const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL!,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-})
+// Environment variable validation
+const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN
 
-// Rate limiter: 5 downloads per hour per IP
-export const rateLimiter = new Ratelimit({
-  redis,
-  limiter: Ratelimit.slidingWindow(5, '1 h'),
-  analytics: true,
-})
+if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) {
+  console.warn('⚠️ Redis environment variables not found. Some features may be disabled.')
+}
+
+// Initialize Redis client with fallback
+export const redis = UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN 
+  ? new Redis({
+      url: UPSTASH_REDIS_REST_URL,
+      token: UPSTASH_REDIS_REST_TOKEN,
+    })
+  : null
+
+// Rate limiter with fallback
+export const rateLimiter = redis 
+  ? new Ratelimit({
+      redis,
+      limiter: Ratelimit.slidingWindow(5, '1 h'),
+      analytics: true,
+    })
+  : {
+      // Fallback rate limiter for development
+      limit: async () => ({ success: true, limit: 5, remaining: 4, reset: Date.now() + 3600000 })
+    }
 
 // Validate Obsidian Publish URL
 export function validateObsidianUrl(url: string): boolean {
@@ -42,6 +57,11 @@ export function generateDownloadId(): string {
 
 // Check if vault is blocked
 export async function isVaultBlocked(vaultId: string): Promise<boolean> {
+  if (!redis) {
+    console.warn('Redis not available, skipping vault block check')
+    return false
+  }
+  
   try {
     const blocked = await redis.sismember('blocked_vaults', vaultId)
     return !!blocked
@@ -58,6 +78,11 @@ export async function logConsent(data: {
   vaultId: string
   timestamp: string
 }) {
+  if (!redis) {
+    console.warn('Redis not available, consent logging disabled')
+    return
+  }
+  
   try {
     const key = `consent:${data.vaultId}:${Date.now()}`
     await redis.setex(key, 30 * 24 * 60 * 60, JSON.stringify(data)) // Keep for 30 days
@@ -134,6 +159,10 @@ export function sanitizeFilename(filename: string): string {
 
 // Block a vault (for takedown requests)
 export async function blockVault(vaultId: string, reason?: string): Promise<void> {
+  if (!redis) {
+    throw new Error('Redis not available')
+  }
+  
   try {
     await redis.sadd('blocked_vaults', vaultId)
     
@@ -154,6 +183,8 @@ export async function blockVault(vaultId: string, reason?: string): Promise<void
 
 // Get blocked vault info
 export async function getBlockedVaultInfo(vaultId: string) {
+  if (!redis) return null
+  
   try {
     return await redis.hgetall(`blocked_vault:${vaultId}`)
   } catch (error) {
@@ -164,6 +195,10 @@ export async function getBlockedVaultInfo(vaultId: string) {
 
 // Unblock a vault (for resolved disputes)
 export async function unblockVault(vaultId: string): Promise<void> {
+  if (!redis) {
+    throw new Error('Redis not available')
+  }
+  
   try {
     await redis.srem('blocked_vaults', vaultId)
     await redis.del(`blocked_vault:${vaultId}`)
@@ -176,6 +211,10 @@ export async function unblockVault(vaultId: string): Promise<void> {
 
 // Get download statistics with proper typing
 export async function getDownloadStats() {
+  if (!redis) {
+    return { total: 0, today: 0 }
+  }
+  
   try {
     const totalDownloadsRaw = await redis.get('total_downloads')
     const dailyDownloadsRaw = await redis.get(`daily_downloads:${new Date().toISOString().split('T')[0]}`)
@@ -196,6 +235,11 @@ export async function getDownloadStats() {
 
 // Increment download counter
 export async function incrementDownloadCount(vaultId: string): Promise<void> {
+  if (!redis) {
+    console.warn('Redis not available, download count not tracked')
+    return
+  }
+  
   try {
     const today = new Date().toISOString().split('T')[0]
     
