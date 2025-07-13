@@ -1,7 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  swcMinify: true, // Add this like in strahil repo
   
   // Skip build errors for Vercel deployment
   eslint: {
